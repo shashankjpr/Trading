@@ -53,14 +53,14 @@ def main():
     parser.add_argument(
         "--min-intensity",
         type=float,
-        default=2.0,
-        help="Min inflection intensity in %% (default: 2.0)",
+        default=3.0,
+        help="Min inflection intensity in %% (default: 3.0)",
     )
     parser.add_argument(
         "--merge-tolerance",
         type=float,
-        default=0.7,
-        help="Merge tolerance for nearby levels in %% (default: 0.7)",
+        default=0.12,
+        help="Merge tolerance for nearby levels in %% (default: 0.12)",
     )
     parser.add_argument(
         "--zone-tolerance",
@@ -172,8 +172,8 @@ def main():
             right_bars=args.right_bars,
             min_touches=args.min_touches,
             min_intensity_pct=args.min_intensity,
-            merge_tol_pct=args.merge_tolerance,
-            zone_tol_pct=args.zone_tolerance,
+            min_tol_pct=args.merge_tolerance,
+            auto_intensity=True,
         )
 
         # Analyze

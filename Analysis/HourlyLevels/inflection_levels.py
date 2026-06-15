@@ -47,30 +47,64 @@ class InflectionLevelsCalculator:
         lookback_days: int = 30,
         left_bars: int = 5,
         right_bars: int = 5,
-        min_touches: int = 2,
-        min_intensity_pct: float = 0.30,
-        merge_tol_pct: float = 0.30,
-        zone_tol_pct: float = 0.80,
+        min_touches: int = 1,
+        min_intensity_pct: float = 3.0,
+        min_tol_pct: float = 0.12,
+        auto_intensity: bool = True,
     ):
         """
         Args:
             lookback_days: Historical bars to analyze (days).
             left_bars: Bars to the left of pivot to check for higher/lower.
             right_bars: Bars to the right of pivot to check for higher/lower.
-            min_touches: Minimum touch count to qualify a level.
+            min_touches: Minimum touch count to qualify a zone.
             min_intensity_pct: Minimum displacement (%) between pivot and opposite extreme.
-            merge_tol_pct: Tolerance (%) for merging nearby levels.
-            zone_tol_pct: Tolerance (%) for grouping levels into zones.
+            min_tol_pct: Tolerance (%) for merging nearby pivot prices into a zone.
+            auto_intensity: If True, use ATR% to determine intensity threshold.
         """
         self.lookback_days = lookback_days
         self.left_bars = left_bars
         self.right_bars = right_bars
         self.min_touches = min_touches
         self.min_intensity_pct = min_intensity_pct
-        self.merge_tol_pct = merge_tol_pct
-        self.zone_tol_pct = zone_tol_pct
+        self.min_tol_pct = min_tol_pct
+        self.auto_intensity = auto_intensity
 
         self.win_len = left_bars + right_bars + 1
+
+    def compute_atr_percent(self, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray) -> float:
+        """Compute ATR% using a 14-period ATR on hourly bars."""
+        if len(highs) < 15:
+            return float("nan")
+
+        prev_closes = np.concatenate(([np.nan], closes[:-1]))
+        true_range = np.maximum.reduce(
+            [highs - lows, np.abs(highs - prev_closes), np.abs(lows - prev_closes)]
+        )
+        true_range[0] = np.nan
+
+        tr_series = pd.Series(true_range)
+        atr14 = tr_series.rolling(14, min_periods=14).mean().to_numpy()
+        last_atr = atr14[-1]
+        if np.isnan(last_atr) or closes[-1] == 0:
+            return float("nan")
+
+        return last_atr / closes[-1] * 100
+
+    def effective_intensity_threshold(self, highs: np.ndarray, lows: np.ndarray, closes: np.ndarray) -> float:
+        """Return the active intensity threshold based on ATR% or manual setting."""
+        if not self.auto_intensity:
+            return self.min_intensity_pct
+
+        atr_pct = self.compute_atr_percent(highs, lows, closes)
+        if np.isnan(atr_pct):
+            return self.min_intensity_pct
+
+        if atr_pct > 6.0:
+            return 10.0
+        if atr_pct >= 3.0:
+            return 6.0
+        return 3.0
 
     def detect_pivot_highs(self, highs: np.ndarray) -> np.ndarray:
         """Detect pivot highs: high[i] > high[i-left:i] and high[i] > high[i+1:i+right+1]."""
@@ -108,223 +142,171 @@ class InflectionLevelsCalculator:
         if is_high:
             pivot = highs[pivot_idx]
             opposite = np.min(lows[start:end])
-            intensity = (pivot - opposite) / pivot * 100 if pivot != 0 else 0
+            intensity = (pivot - opposite) / pivot * 100 if pivot != 0 else 0.0
         else:
             pivot = lows[pivot_idx]
             opposite = np.max(highs[start:end])
-            intensity = (opposite - pivot) / pivot * 100 if pivot != 0 else 0
+            intensity = (opposite - pivot) / pivot * 100 if pivot != 0 else 0.0
 
         return intensity
 
-    def merge_nearby_levels(self, prices: List[Tuple[float, int]], tolerance_pct: float) -> List[Tuple[float, int]]:
-        """
-        Merge levels within tolerance (%) of each other.
-        Returns merged prices with accumulated touch counts.
-        """
-        if not prices:
-            return []
-
-        sorted_prices = sorted(prices, key=lambda x: x[0])
-        merged = []
-        current_group = [sorted_prices[0]]
-
-        for i in range(1, len(sorted_prices)):
-            price, count = sorted_prices[i]
-            ref_price = current_group[0][0]
-            pct_diff = abs(price - ref_price) / ref_price * 100
-
-            if pct_diff <= tolerance_pct:
-                current_group.append((price, count))
-            else:
-                avg_price = np.mean([p[0] for p in current_group])
-                total_count = sum(p[1] for p in current_group)
-                merged.append((avg_price, total_count))
-                current_group = [(price, count)]
-
-        if current_group:
-            avg_price = np.mean([p[0] for p in current_group])
-            total_count = sum(p[1] for p in current_group)
-            merged.append((avg_price, total_count))
-
-        return merged
-
-    def cluster_into_zones(self, prices: List[float], tolerance_pct: float) -> List[Tuple[float, float, List[float]]]:
-        """
-        Cluster prices into zones within tolerance (%).
-        Returns list of (zone_min, zone_max, prices_in_zone).
-        """
-        if len(prices) <= 1:
-            return [(p, p, [p]) for p in prices]
-
-        sorted_prices = sorted(prices)
-        zones = []
-        cluster_prices = [sorted_prices[0]]
-        cluster_min = sorted_prices[0]
-
-        for i in range(1, len(sorted_prices)):
-            price = sorted_prices[i]
-            pct_diff = (price - cluster_prices[-1]) / cluster_prices[-1] * 100
-
-            if pct_diff <= tolerance_pct:
-                cluster_prices.append(price)
-            else:
-                if len(cluster_prices) >= 1:
-                    zones.append((min(cluster_prices), max(cluster_prices), cluster_prices.copy()))
-                cluster_prices = [price]
-
-        if cluster_prices:
-            zones.append((min(cluster_prices), max(cluster_prices), cluster_prices.copy()))
-
-        return zones
-
     def analyze(self, df: pd.DataFrame) -> Dict[str, List[PivotLevel]]:
         """
-        Analyze hourly OHLC data and return identified levels.
+        Analyze hourly OHLC data and return identified raw pivot levels.
 
         Args:
             df: DataFrame with columns [timestamp, open, high, low, close].
-               Index should be consecutive hourly bars.
+                 Index should be consecutive hourly bars.
 
         Returns:
-            Dict with keys 'PH', 'PL', 'BPH', 'BPL', each containing list of PivotLevel objects.
+            Dict with keys 'PH', 'PL', 'BPH', 'BPL', each containing raw PivotLevel objects.
         """
         if df.empty or len(df) < self.win_len:
             return {"PH": [], "PL": [], "BPH": [], "BPL": []}
 
-        highs = df["high"].values
-        lows = df["low"].values
-        opens = df["open"].values
-        closes = df["close"].values
+        df = df.sort_values("timestamp").reset_index(drop=True)
+        cutoff_time = df["timestamp"].iloc[-1] - pd.Timedelta(days=self.lookback_days)
 
-        # Detect pivots
+        highs = df["high"].to_numpy(dtype=float)
+        lows = df["low"].to_numpy(dtype=float)
+        opens = df["open"].to_numpy(dtype=float)
+        closes = df["close"].to_numpy(dtype=float)
+
+        effective_threshold = self.effective_intensity_threshold(highs, lows, closes)
+
         ph_pivots = self.detect_pivot_highs(highs)
         pl_pivots = self.detect_pivot_lows(lows)
         bph_pivots = self.detect_pivot_highs(np.maximum(opens, closes))
         bpl_pivots = self.detect_pivot_lows(np.minimum(opens, closes))
 
-        # Collect pivot data: (price, intensity, index)
-        ph_data = []
-        pl_data = []
-        bph_data = []
-        bpl_data = []
+        levels = {"PH": [], "PL": [], "BPH": [], "BPL": []}
 
         for i in range(len(df)):
+            bar_time = df["timestamp"].iloc[i]
+            if bar_time < cutoff_time:
+                continue
+
             if not np.isnan(ph_pivots[i]):
                 intensity = self.calculate_intensity(i, highs, lows, is_high=True)
-                if intensity >= self.min_intensity_pct:
-                    ph_data.append((ph_pivots[i], intensity, i))
-
-            if not np.isnan(pl_pivots[i]):
-                intensity = self.calculate_intensity(i, highs, lows, is_high=False)
-                if intensity >= self.min_intensity_pct:
-                    pl_data.append((pl_pivots[i], intensity, i))
-
-            if not np.isnan(bph_pivots[i]):
-                body_high = max(opens[i], closes[i])
-                body_low = min(opens[i], closes[i])
-                lows_window = np.minimum(opens, closes)
-                intensity = (body_high - np.min(lows_window[max(0, i - self.left_bars) : i + self.right_bars + 1])) / body_high * 100 if body_high != 0 else 0
-                if intensity >= self.min_intensity_pct:
-                    bph_data.append((body_high, intensity, i))
-
-            if not np.isnan(bpl_pivots[i]):
-                body_low = min(opens[i], closes[i])
-                body_high = max(opens[i], closes[i])
-                highs_window = np.maximum(opens, closes)
-                intensity = (np.max(highs_window[max(0, i - self.left_bars) : i + self.right_bars + 1]) - body_low) / body_low * 100 if body_low != 0 else 0
-                if intensity >= self.min_intensity_pct:
-                    bpl_data.append((body_low, intensity, i))
-
-        # Merge and count touches
-        def process_pivots(data: List[Tuple[float, float, int]], level_type: str) -> List[PivotLevel]:
-            if not data:
-                return []
-
-            # Group by price within tolerance
-            price_groups = {}
-            for price, intensity, idx in data:
-                found_group = False
-                for key in price_groups:
-                    if abs(price - key) / key * 100 <= self.merge_tol_pct:
-                        price_groups[key].append((price, intensity, idx))
-                        found_group = True
-                        break
-                if not found_group:
-                    price_groups[price] = [(price, intensity, idx)]
-
-            # Create PivotLevel objects
-            levels = []
-            for prices_in_group in price_groups.values():
-                # Select the level with max intensity from the cluster
-                max_intensity_idx = np.argmax([p[1] for p in prices_in_group])
-                max_intensity_level = prices_in_group[max_intensity_idx]
-                selected_price = max_intensity_level[0]
-                selected_intensity = max_intensity_level[1]
-                touches = len(prices_in_group)
-                first_idx = min(p[2] for p in prices_in_group)
-                last_idx = max(p[2] for p in prices_in_group)
-
-                if touches >= self.min_touches:
-                    levels.append(
+                if intensity >= effective_threshold:
+                    levels["PH"].append(
                         PivotLevel(
-                            price=selected_price,
-                            level_type=level_type,
-                            intensity=selected_intensity,
-                            touches=touches,
-                            first_seen_idx=first_idx,
-                            last_touch_idx=last_idx,
+                            price=float(ph_pivots[i]),
+                            level_type="PH",
+                            intensity=float(intensity),
+                            touches=1,
+                            first_seen_idx=i,
+                            last_touch_idx=i,
                         )
                     )
 
-            return sorted(levels, key=lambda x: x.price)
+            if not np.isnan(pl_pivots[i]):
+                intensity = self.calculate_intensity(i, highs, lows, is_high=False)
+                if intensity >= effective_threshold:
+                    levels["PL"].append(
+                        PivotLevel(
+                            price=float(pl_pivots[i]),
+                            level_type="PL",
+                            intensity=float(intensity),
+                            touches=1,
+                            first_seen_idx=i,
+                            last_touch_idx=i,
+                        )
+                    )
 
-        return {
-            "PH": process_pivots(ph_data, "PH"),
-            "PL": process_pivots(pl_data, "PL"),
-            "BPH": process_pivots(bph_data, "BPH"),
-            "BPL": process_pivots(bpl_data, "BPL"),
-        }
+            if not np.isnan(bph_pivots[i]):
+                body_high = float(max(opens[i], closes[i]))
+                body_low = float(min(opens[i], closes[i]))
+                lows_window = np.minimum(opens, closes)
+                start = max(0, i - self.left_bars)
+                end = min(len(df), i + self.right_bars + 1)
+                intensity = (
+                    body_high - np.min(lows_window[start:end])
+                ) / body_high * 100 if body_high != 0 else 0.0
+                if intensity >= effective_threshold:
+                    levels["BPH"].append(
+                        PivotLevel(
+                            price=body_high,
+                            level_type="BPH",
+                            intensity=float(intensity),
+                            touches=1,
+                            first_seen_idx=i,
+                            last_touch_idx=i,
+                        )
+                    )
 
-    def cluster_levels(self, levels: List[PivotLevel]) -> List[PivotZone]:
+            if not np.isnan(bpl_pivots[i]):
+                body_low = float(min(opens[i], closes[i]))
+                body_high = float(max(opens[i], closes[i]))
+                highs_window = np.maximum(opens, closes)
+                start = max(0, i - self.left_bars)
+                end = min(len(df), i + self.right_bars + 1)
+                intensity = (
+                    np.max(highs_window[start:end]) - body_low
+                ) / body_low * 100 if body_low != 0 else 0.0
+                if intensity >= effective_threshold:
+                    levels["BPL"].append(
+                        PivotLevel(
+                            price=body_low,
+                            level_type="BPL",
+                            intensity=float(intensity),
+                            touches=1,
+                            first_seen_idx=i,
+                            last_touch_idx=i,
+                        )
+                    )
+
+        return levels
+
+    def cluster_levels(self, levels: List[PivotLevel], min_touches: Optional[int] = None) -> List[PivotZone]:
         """
-        Cluster levels into zones.
-        Returns PivotZone objects for visualization and analysis.
+        Cluster raw pivot levels into zones using the indicator's tolerance.
+
+        Args:
+            levels: Raw pivot levels sorted by type.
+            min_touches: Override minimum touches for zone qualification.
+
+        Returns:
+            List of PivotZone objects.
         """
+        if min_touches is None:
+            min_touches = self.min_touches
+
         if not levels:
             return []
 
         sorted_levels = sorted(levels, key=lambda x: x.price)
-        zones = []
-        cluster = [sorted_levels[0]]
+        zones: List[PivotZone] = []
+        cluster: List[PivotLevel] = [sorted_levels[0]]
 
-        for i in range(1, len(sorted_levels)):
-            level = sorted_levels[i]
+        for level in sorted_levels[1:]:
             prev_price = cluster[-1].price
-
-            if abs(level.price - prev_price) / prev_price * 100 <= self.zone_tol_pct:
+            if prev_price == 0 or (level.price - prev_price) / prev_price * 100 <= self.min_tol_pct:
                 cluster.append(level)
             else:
-                if len(cluster) >= 1:
+                if len(cluster) >= min_touches:
                     prices = [l.price for l in cluster]
-                    zone = PivotZone(
-                        level_type=cluster[0].level_type,
-                        price_min=min(prices),
-                        price_max=max(prices),
-                        price_center=np.mean(prices),
-                        levels=cluster.copy(),
+                    zones.append(
+                        PivotZone(
+                            level_type=cluster[0].level_type,
+                            price_min=min(prices),
+                            price_max=max(prices),
+                            price_center=float(np.mean(prices)),
+                            levels=cluster.copy(),
+                        )
                     )
-                    zones.append(zone)
                 cluster = [level]
 
-        if cluster:
+        if cluster and len(cluster) >= min_touches:
             prices = [l.price for l in cluster]
-            zone = PivotZone(
-                level_type=cluster[0].level_type,
-                price_min=min(prices),
-                price_max=max(prices),
-                price_center=np.mean(prices),
-                levels=cluster,
+            zones.append(
+                PivotZone(
+                    level_type=cluster[0].level_type,
+                    price_min=min(prices),
+                    price_max=max(prices),
+                    price_center=float(np.mean(prices)),
+                    levels=cluster.copy(),
+                )
             )
-            zones.append(zone)
 
         return zones
