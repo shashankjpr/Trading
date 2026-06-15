@@ -1,0 +1,18 @@
+# Ignore Python cache directories
+__pycache__/
+*.py[cod]
+
+# Ignore historical data cache files
+HistoricalData/Storage/cache/
+
+# Ignore DuckDB database files
+HistoricalData/Storage/*.duckdb
+
+# Ignore analysis results
+Analysis/HourlyLevels/results/
+
+# Ignore environment and editor files
+.env
+.venv/
+.idea/
+.vscode/
